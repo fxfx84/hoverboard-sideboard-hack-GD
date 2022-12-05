@@ -28,6 +28,40 @@
 #include "util.h"
 #include "mpu6050.h"
 
+float motor_pwms = 0;
+float integral_loop=0;
+float pitch=0;
+float Igain=0.0001;
+float Pgain=0.08;
+#define MAX_STEP_UP_ANGLE 5
+
+#define MAX_CONTROL_OUTPUT 500
+#define ITERM_MAX_ERROR 30   // Iterm windup constants for PI control 
+#define ITERM_MAX 10000
+
+#define ANGLE_OFFSET 0.0  // Offset angle for balance (to compensate board own weight distribution)
+
+#define KP 2//0.32       
+#define KD 800//0.35//0.050     
+#define KP_THROTTLE 2//0.051//0.080 
+#define KI_THROTTLE 0//0.01//0.1 
+
+#define KP_POSITION 0.06  
+#define KD_POSITION 0.45  
+
+
+float Kp = KP;
+float Kd = KD;
+float Kp_thr = KP_THROTTLE;
+float Ki_thr = KI_THROTTLE;
+
+float Kp_user = KP;
+float Kd_user = KD;
+float Kp_thr_user = KP_THROTTLE;
+float Ki_thr_user = KI_THROTTLE;
+float Kp_position = KP_POSITION;
+float Kd_position = KD_POSITION;
+
 // USART1 variables
 #ifdef SERIAL_CONTROL
 static SerialSideboard Sideboard;
@@ -215,10 +249,12 @@ void input_init(void) {
         if(mpu_config()) {                              // IMU MPU-6050 config
             mpuStatus = ERROR;
             gpio_bit_set(LED1_GPIO_Port, LED1_Pin);     // Turn on RED LED - sensor enabled and NOT ok
+            // gpio_bit_set(LED2_GPIO_Port, LED2_Pin);
         }
         else {
             mpuStatus = SUCCESS;
             gpio_bit_set(LED2_GPIO_Port, LED2_Pin);     // Turn on GREEN LED - sensor enabled and ok
+            // gpio_bit_set(LED1_GPIO_Port, LED1_Pin);
         }
     #else
         gpio_bit_set(LED2_GPIO_Port, LED2_Pin);         // Turn on GREEN LED - sensor disabled
@@ -268,6 +304,9 @@ void handle_sensors(void) {
     } else if(sensor1 == SET && sensor1_read == RESET) {
         // Sensor DEACTIVE: Do something here (one time task on deactivation)
         sensor1 = RESET;
+        cmd1=0;
+        cmd2=0;
+        integral_loop=0;
         gpio_bit_reset(LED4_GPIO_Port, LED4_Pin);
         consoleLog("SENSOR 1 OFF\r\n");
     }
@@ -286,11 +325,78 @@ void handle_sensors(void) {
     }
 
     if (sensor1 == SET) {
+        if(mpu.euler.pitch > -100 && mpu.euler.pitch < 100) {
+             if(mpu.euler.pitch > 0) {Igain=0.000001;
+             }
+             else{Igain=0.000002;
+             }
+        integral_loop+=mpu.euler.pitch*Igain;
+        motor_pwms = (int16_t)(mpu.euler.pitch*0.08 +integral_loop);
+      //  motor_pwms += stabilityPDControl(5,mapped_angle , driving_mode_current_angle, Kp, Kd);
+       // motor_pwms+=(int16_t)roundf(speed_control_acceleration);
+        motor_pwms = CLAMP(motor_pwms, -4000, 4000); // Limit max output from control
+        
+        int16_t t_motor_pwm = //+(int16_t)roundf(speed_control_acceleration);
+        
+        // cmd1=(int16_t)roundf(motor_pwms);
+        cmd2=(int16_t)roundf(motor_pwms);
         // Sensor ACTIVE: Do something here (continuous task)
+        }
+        else {integral_loop=0;
+        }
     }
     if (sensor2 == SET) {
         // Sensor ACTIVE: Do something here (continuous task)
     }
+}
+
+//float hub_speed_kmh 0;
+//loat speed_control_acceleration = speedPIControl(5, hub_speed_kmh, throttle, Kp_thr, Ki_thr);
+
+//speed_control_acceleration = CLAMP(speed_control_acceleration, -2000,2000); // limited output // negative angle is nose up
+        
+#define SPEED_CONTROL_ACCELERATION_GAIN -0.01
+#define THROTTLE_ANGLE_ERROR_GAIN 0.01
+//speed_control_acceleration = speed_control_acceleration * SPEED_CONTROL_ACCELERATION_GAIN;
+
+float stability_setPointOld=0;
+float stability_PID_errorOld=0;
+
+int32_t speed_PID_errorSum = 0;
+
+float stabilityPDControl(float DT, float input, float setPoint,  float Kp, float Kd)
+{
+  float error;
+  float output;
+
+  error = setPoint - input;
+
+  // Kd is implemented in two parts
+  //    The biggest one using only the input (sensor) part not the SetPoint input-input(t-1).
+  //    And the second using the setpoint to make it a bit more agressive   setPoint-setPoint(t-1)
+  float Kd_setPoint = CLAMP((setPoint - stability_setPointOld), -8, 8); // We limit the input part...
+  output = Kp * error + (Kd * Kd_setPoint - Kd * (input - stability_PID_errorOld)) / DT;
+  //Serial.print(Kd*(error-PID_errorOld));Serial.print("\t");
+  //PID_errorOld2 = PID_errorOld;
+  stability_PID_errorOld = input;  // error for Kd is only the input component
+  stability_setPointOld = setPoint;
+  return (output);
+}
+
+// PI controller implementation (Proportional, integral). DT in seconds
+float speedPIControl(float DT, int16_t input, int16_t setPoint,  float Kp, float Ki)
+{
+  int16_t error;
+  float output;
+
+  error = setPoint - input;
+  speed_PID_errorSum += CLAMP(error, -ITERM_MAX_ERROR, ITERM_MAX_ERROR);
+  speed_PID_errorSum = CLAMP(speed_PID_errorSum, -ITERM_MAX, ITERM_MAX);
+
+  //Serial.println(PID_errorSum);
+
+  output = (Kp * error) + (Ki * speed_PID_errorSum) * DT; // DT is in miliseconds...
+  return (output);
 }
 
 /*
@@ -304,7 +410,9 @@ void handle_usart(void) {
             Sideboard.pitch     = (int16_t)mpu.euler.pitch;
             Sideboard.dPitch    = (int16_t)mpu.gyro.y;
             Sideboard.cmd1      = (int16_t)cmd1;
-            Sideboard.cmd2      = (int16_t)cmd2; 
+            Sideboard.cmd2      = (int16_t)cmd2;
+            // Sideboard.cmd1      = (int16_t)200; 
+            // Sideboard.cmd2      = (int16_t)200;             
             Sideboard.sensors   = (uint16_t)( (cmdSwitch << 8)  | (sensor1 | (sensor2 << 1) | (mpuStatus << 2)) );
             Sideboard.checksum  = (uint16_t)(Sideboard.start ^ Sideboard.pitch ^ Sideboard.dPitch ^ Sideboard.cmd1 ^ Sideboard.cmd2 ^ Sideboard.sensors);
         
@@ -387,6 +495,7 @@ void handle_leds(void) {
             if (Feedback.cmdLed & LED5_SET) { gpio_bit_set(LED5_GPIO_Port, LED5_Pin); } else { gpio_bit_reset(LED5_GPIO_Port, LED5_Pin); }
             if (Feedback.cmdLed & LED4_SET) { gpio_bit_set(AUX3_GPIO_Port, AUX3_Pin); } else { gpio_bit_reset(AUX3_GPIO_Port, AUX3_Pin); }
         }
+        
     #endif
 }
 
